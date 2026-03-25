@@ -244,32 +244,22 @@ function getColumnMap_(sheet) {
     throw new Error('Configuration error: header row is missing.');
   }
 
-  const headers = targetSheet.getRange(1, 1, 1, lastCol).getValues()[0].map(normalizeHeader_);
-
-  const aliases = {
-    itemId: ['item id', 'itemid', 'id'],
-    itemName: ['item name', 'name', 'item'],
-    room: ['room'],
-    location: ['specific location', 'location', 'loc'],
-    qty: ['qty', 'quantity', 'stock', 'count'],
-    category: ['category', 'type'],
-    status: ['status', 'condition'],
-    qrLink: ['qr code link (auto-generated)', 'qr code link', 'qr link', 'qrcode link'],
-    unit: ['unit'],
-    remarks: ['remarks', 'remark', 'notes', 'note'],
-    locationCode: ['location code', 'loc code', 'locationcode']
-  };
-
-  const map = {};
-  Object.keys(aliases).forEach(function(field) {
-    map[field] = findHeaderIndex_(headers, aliases[field]);
-  });
+  const soft = computeColumnMapSoft_(targetSheet);
+  const map = soft.map;
 
   const missing = REQUIRED_FIELDS.filter(function(field) {
     return map[field] <= 0;
   });
   if (missing.length) {
-    throw new Error('Configuration error: missing required columns: ' + missing.join(', '));
+    const found = soft.foundRequired;
+    const diagnostics = [
+      'Configuration error: missing required columns: ' + missing.join(', '),
+      'Sheet: ' + targetSheet.getName(),
+      'Found required columns: ' + (found.length ? found.join(', ') : '(none)'),
+      'Missing required columns: ' + missing.join(', '),
+      'Raw headers: ' + soft.headersRaw.map(function(h) { return safeString_(h) || '(blank)'; }).join(' | ')
+    ].join(' | ');
+    throw new Error(diagnostics);
   }
 
   OPTIONAL_FIELDS.forEach(function(field) {
@@ -389,12 +379,14 @@ function buildPageState_(e) {
   }
 
   let columns = null;
+  let columnDiagnostics = null;
   let locations = [];
   let items = [];
 
   try {
     const sheet = getInventorySheet_();
     columns = getColumnMap_(sheet);
+    columnDiagnostics = buildColumnDiagnostics_(sheet, columns, []);
     locations = getAllLocations_();
 
     if (sheet.getLastRow() < 2) {
@@ -411,6 +403,14 @@ function buildPageState_(e) {
     }
   } catch (err) {
     notices.push({ type: 'error', text: err && err.message ? err.message : String(err) });
+    try {
+      const sheetForDiag = getInventorySheet_();
+      const softMap = computeColumnMapSoft_(sheetForDiag);
+      const diag = buildColumnDiagnostics_(sheetForDiag, softMap.map, softMap.missingRequired);
+      notices.push({ type: 'info', text: diag });
+    } catch (diagErr) {
+      notices.push({ type: 'info', text: 'Diagnostics unavailable: ' + (diagErr && diagErr.message ? diagErr.message : String(diagErr)) });
+    }
     return buildBaseState_({
       mode: isLocationRoute ? mode : 'landing',
       room: room,
@@ -419,7 +419,8 @@ function buildPageState_(e) {
       locations: [],
       notices: notices,
       config: cfg,
-      columns: columns
+      columns: columns,
+      columnDiagnostics: columnDiagnostics
     });
   }
 
@@ -431,7 +432,8 @@ function buildPageState_(e) {
     locations: locations,
     notices: notices,
     config: cfg,
-    columns: columns
+    columns: columns,
+    columnDiagnostics: columnDiagnostics
   });
 }
 
@@ -451,6 +453,7 @@ function buildBaseState_(input) {
     statusOptions: STATUS_OPTIONS,
     config: input.config,
     columns: input.columns,
+    columnDiagnostics: input.columnDiagnostics || '',
     baseUrl: baseUrl,
     hasBaseUrl: !!baseUrl,
     debug: DEBUG
@@ -559,7 +562,10 @@ function renderLanding_(state) {
   });
 
   if (!rooms.length) {
-    return '<section class="empty">No inventory locations found yet.</section>';
+    const hasErrorNotice = (state.notices || []).some(function(n) { return n.type === 'error'; });
+    return '<section class="empty">' + (hasErrorNotice
+      ? 'Unable to load locations due to configuration/data mapping issue.'
+      : 'No inventory locations found yet.') + '</section>';
   }
 
   const groupsHtml = rooms.map(function(room) {
@@ -858,10 +864,64 @@ function validateSavePayload_(payload) {
 
 function normalizeHeader_(value) {
   return safeString_(value)
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\r\n\t]+/g, ' ')
     .toLowerCase()
     .replace(/[_-]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function buildColumnDiagnostics_(sheet, map, missingOverride) {
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const requiredFound = map ? REQUIRED_FIELDS.filter(function(f) { return map[f] > 0; }) : [];
+  const requiredMissing = Array.isArray(missingOverride) ? missingOverride : REQUIRED_FIELDS.filter(function(f) { return !map || map[f] <= 0; });
+  const cfg = getConfigStatus_();
+
+  return [
+    'Diagnostics — sheet=' + sheet.getName(),
+    'SPREADSHEET_ID set=' + (cfg.spreadsheetIdConfigured ? 'yes' : 'no'),
+    'WEB_APP_BASE_URL set=' + (cfg.webAppBaseUrlConfigured ? 'yes' : 'no'),
+    'required found=' + (requiredFound.length ? requiredFound.join(', ') : '(none)'),
+    'required missing=' + (requiredMissing.length ? requiredMissing.join(', ') : '(none)'),
+    'headers=' + headers.map(function(h) { return safeString_(h) || '(blank)'; }).join(' | ')
+  ].join(' | ');
+}
+
+function computeColumnMapSoft_(sheet) {
+  const aliases = {
+    itemId: ['item id', 'itemid', 'id'],
+    itemName: ['item name', 'name', 'item'],
+    room: ['room'],
+    location: ['specific location', 'location', 'loc'],
+    qty: ['qty', 'quantity', 'stock', 'count'],
+    category: ['category', 'type'],
+    status: ['status', 'condition'],
+    qrLink: ['qr code link (auto-generated)', 'qr code link', 'qr link', 'qrcode link', 'qr url'],
+    unit: ['unit'],
+    remarks: ['remarks', 'remark', 'notes', 'note'],
+    locationCode: ['location code', 'loc code', 'locationcode']
+  };
+  const headersRaw = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const headers = headersRaw.map(normalizeHeader_);
+
+  const map = {};
+  Object.keys(aliases).forEach(function(field) {
+    map[field] = findHeaderIndex_(headers, aliases[field]);
+  });
+  OPTIONAL_FIELDS.forEach(function(field) {
+    if (!map[field] || map[field] < 0) map[field] = -1;
+  });
+  const foundRequired = REQUIRED_FIELDS.filter(function(field) { return map[field] > 0; });
+  const missingRequired = REQUIRED_FIELDS.filter(function(field) { return map[field] <= 0; });
+
+  return {
+    map: map,
+    headersRaw: headersRaw,
+    foundRequired: foundRequired,
+    missingRequired: missingRequired
+  };
 }
 
 function findHeaderIndex_(normalizedHeaders, allowedAliases) {
@@ -877,6 +937,7 @@ function normalizeStatus_(status) {
   const key = safeString_(status).toLowerCase();
   return STATUS_CANONICAL_MAP[key] || '';
 }
+
 
 function normalizeQty_(qty) {
   const n = Number(qty);
