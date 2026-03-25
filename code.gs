@@ -1,98 +1,98 @@
-const DEBUG = false;
+/*************************************
+ * D&T QR Inventory System (Standalone)
+ * Single-file production-ready Apps Script web app
+ *************************************/
 
-const APP = Object.freeze({
-  title: 'D&T QR Inventory System',
-  defaultInventorySheetName: 'Inventory',
-  statuses: ['Good', 'Low Stock', 'Missing', 'Needs Maintenance'],
-  propertyKeys: {
-    spreadsheetId: 'SPREADSHEET_ID',
-    webAppBaseUrl: 'WEB_APP_BASE_URL',
-    inventorySheetName: 'INVENTORY_SHEET_NAME'
-  },
-  headerAliases: {
-    itemId: ['item id', 'itemid', 'id'],
-    itemName: ['item name', 'itemname', 'name'],
-    room: ['room'],
-    location: ['specific location', 'location', 'specificlocation'],
-    qty: ['qty', 'quantity'],
-    category: ['category'],
-    status: ['status'],
-    qrLink: ['qr code link (auto-generated)', 'qr code link', 'qr link', 'qr url']
-  }
-});
+const DEBUG = false;
+const DEFAULT_SHEET_NAME = 'Inventory';
+const REQUIRED_FIELDS = ['itemId', 'itemName', 'room', 'location', 'qty', 'category', 'status', 'qrLink'];
+const OPTIONAL_FIELDS = ['unit', 'remarks', 'locationCode'];
+const STATUS_OPTIONS = ['Good', 'Low Stock', 'Missing', 'Needs Maintenance'];
+const STATUS_CANONICAL_MAP = {
+  'good': 'Good',
+  'low stock': 'Low Stock',
+  'missing': 'Missing',
+  'needs maintenance': 'Needs Maintenance'
+};
+
+/** ---------------------------
+ *  Public entry points
+ *  --------------------------- */
 
 function doGet(e) {
+  let state;
   try {
-    const params = parseParams_(e);
-    const page = buildPageState_(params);
-    return HtmlService.createHtmlOutput(renderAppHtml_(page))
-      .setTitle(APP.title)
-      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+    state = buildPageState_(e);
   } catch (err) {
-    return HtmlService.createHtmlOutput(renderConfigErrorHtml_(err))
-      .setTitle(APP.title);
+    return HtmlService.createHtmlOutput(
+      buildShellHtml_(buildFatalState_(err))
+    ).setTitle('D&T Inventory').setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   }
+
+  return HtmlService.createHtmlOutput(buildShellHtml_(state))
+    .setTitle('D&T Inventory')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
 function saveInventoryUpdates(payload) {
   try {
-    validateSavePayloadShape_(payload);
+    validateSavePayload_(payload);
 
-    const room = cleanString_(payload.room);
-    const location = cleanString_(payload.location);
-    if (!room || !location) {
-      throw new Error('Missing room/location context for save.');
-    }
+    const room = safeString_(payload.room);
+    const location = safeString_(payload.location);
+    const updates = payload.updates;
 
     const sheet = getInventorySheet_();
-    const columnMap = getColumnMap_(sheet);
-    const dataRows = getSheetDataRows_(sheet, columnMap);
-
-    if (!dataRows.length) {
-      throw new Error('The inventory sheet has no data rows to update.');
+    const colMap = getColumnMap_(sheet);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      throw new Error('Save failure: inventory sheet contains no data rows.');
     }
 
-    const lookup = buildRowLookup_(dataRows, columnMap);
-    const allowedStatuses = APP.statuses.reduce(function (acc, value) {
-      acc[value] = true;
-      return acc;
-    }, {});
-
-    const updates = payload.items.map(function (entry) {
-      const rowNumber = Number(entry.rowNumber);
-      if (!rowNumber || !lookup[rowNumber]) {
-        throw new Error('Invalid row number: ' + entry.rowNumber);
-      }
-
-      const source = lookup[rowNumber];
-      if (source.room !== room || source.location !== location) {
-        throw new Error('Row ' + rowNumber + ' is outside selected room/location.');
-      }
-
-      const qty = Number(entry.qty);
-      if (!isFinite(qty) || qty < 0) {
-        throw new Error('Invalid quantity for row ' + rowNumber + '. Quantity must be numeric and non-negative.');
-      }
-
-      const status = cleanString_(entry.status);
-      if (!allowedStatuses[status]) {
-        throw new Error('Invalid status for row ' + rowNumber + ': ' + status);
-      }
-
-      return { rowNumber: rowNumber, qty: qty, status: status };
+    const values = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    const rowDataMap = {};
+    values.forEach(function(row, i) {
+      rowDataMap[i + 2] = row;
     });
 
-    updates.forEach(function (u) {
-      sheet.getRange(u.rowNumber, columnMap.qty).setValue(u.qty);
-      sheet.getRange(u.rowNumber, columnMap.status).setValue(u.status);
+    updates.forEach(function(update) {
+      const rowNumber = Number(update.rowNumber);
+      const qtyValue = normalizeQty_(update.qty);
+      const statusValue = normalizeStatus_(update.status);
+
+      if (!Number.isInteger(rowNumber) || rowNumber < 2 || rowNumber > lastRow) {
+        throw new Error('Invalid row number: ' + update.rowNumber);
+      }
+      if (!Number.isFinite(qtyValue) || qtyValue < 0) {
+        throw new Error('Invalid quantity at row ' + rowNumber + '. Must be non-negative numeric value.');
+      }
+      if (!statusValue || STATUS_OPTIONS.indexOf(statusValue) === -1) {
+        throw new Error('Invalid status at row ' + rowNumber + '.');
+      }
+
+      const rowValues = rowDataMap[rowNumber];
+      if (!rowValues) {
+        throw new Error('Row not found in sheet: ' + rowNumber);
+      }
+
+      const rowRoom = safeString_(rowValues[colMap.room - 1]);
+      const rowLocation = safeString_(rowValues[colMap.location - 1]);
+      if (rowRoom !== room || rowLocation !== location) {
+        throw new Error('Row ' + rowNumber + ' does not belong to selected room/location.');
+      }
+
+      sheet.getRange(rowNumber, colMap.qty).setValue(qtyValue);
+      sheet.getRange(rowNumber, colMap.status).setValue(statusValue);
     });
+
+    const updatedItems = getInventoryRowsForLocation_(room, location);
 
     return {
       ok: true,
-      message: 'Inventory updated successfully.',
-      room: room,
-      location: location,
-      items: getInventoryRowsForLocation_(room, location)
+      message: 'Saved ' + updates.length + ' item(s) successfully.',
+      updatedCount: updates.length,
+      items: updatedItems,
+      renderedItemsHtml: renderItemCardsHtml_(updatedItems, true, colMap)
     };
   } catch (err) {
     return {
@@ -103,93 +103,177 @@ function saveInventoryUpdates(payload) {
 }
 
 function refreshQrLinks() {
-  const baseUrl = getWebAppBaseUrl_();
-  const sheet = getInventorySheet_();
-  const columnMap = getColumnMap_(sheet);
-  const dataRows = getSheetDataRows_(sheet, columnMap);
-
-  if (!dataRows.length) {
-    return { ok: true, updatedRows: 0, message: 'No data rows found.' };
+  const cfg = getConfigStatus_();
+  if (!cfg.spreadsheetIdConfigured) {
+    throw new Error('Configuration error: SPREADSHEET_ID is not set.');
+  }
+  if (!cfg.webAppBaseUrlConfigured) {
+    throw new Error('Configuration error: WEB_APP_BASE_URL is not set.');
   }
 
-  const output = dataRows.map(function (row) {
-    const room = cleanString_(row[columnMap.room - 1]);
-    const location = cleanString_(row[columnMap.location - 1]);
-    if (!room || !location) return [''];
-    return [createAppUrl_(baseUrl, room, location, '')];
+  const baseUrl = getWebAppBaseUrl_();
+  const sheet = getInventorySheet_();
+  const colMap = getColumnMap_(sheet);
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 2) {
+    return { ok: true, updatedRows: 0, message: 'No data rows to update.' };
+  }
+
+  const width = Math.max(colMap.room, colMap.location, colMap.qrLink);
+  const rows = sheet.getRange(2, 1, lastRow - 1, width).getValues();
+
+  const linkValues = rows.map(function(row) {
+    const room = safeString_(row[colMap.room - 1]);
+    const loc = safeString_(row[colMap.location - 1]);
+    if (!room || !loc) return [''];
+    return [baseUrl + '?room=' + encodeURIComponent(room) + '&loc=' + encodeURIComponent(loc)];
   });
 
-  sheet.getRange(2, columnMap.qrLink, output.length, 1).setValues(output);
-
-  const updatedRows = output.filter(function (row) { return !!row[0]; }).length;
+  sheet.getRange(2, colMap.qrLink, linkValues.length, 1).setValues(linkValues);
   return {
     ok: true,
-    updatedRows: updatedRows,
-    message: 'QR links refreshed for ' + updatedRows + ' row(s).'
+    updatedRows: linkValues.length,
+    message: 'QR links refreshed for ' + linkValues.length + ' rows.'
   };
 }
 
 function setAppConfig(spreadsheetId, webAppBaseUrl, inventorySheetName) {
-  const id = cleanString_(spreadsheetId);
-  const url = cleanString_(webAppBaseUrl);
-
-  if (!id) {
-    throw new Error('spreadsheetId is required.');
+  if (!spreadsheetId || !webAppBaseUrl) {
+    throw new Error('Both spreadsheetId and webAppBaseUrl are required.');
   }
-
   const props = PropertiesService.getScriptProperties();
-  props.setProperty(APP.propertyKeys.spreadsheetId, id);
+  props.setProperty('SPREADSHEET_ID', safeString_(spreadsheetId));
+  props.setProperty('WEB_APP_BASE_URL', safeString_(webAppBaseUrl));
 
-  if (url) {
-    props.setProperty(APP.propertyKeys.webAppBaseUrl, stripQueryString_(url));
-  }
-
-  if (cleanString_(inventorySheetName)) {
-    props.setProperty(APP.propertyKeys.inventorySheetName, cleanString_(inventorySheetName));
+  if (inventorySheetName) {
+    props.setProperty('INVENTORY_SHEET_NAME', safeString_(inventorySheetName));
+  } else {
+    props.deleteProperty('INVENTORY_SHEET_NAME');
   }
 
   return {
     ok: true,
-    message: 'Script Properties updated.',
-    spreadsheetId: id,
-    webAppBaseUrl: url ? stripQueryString_(url) : '',
-    inventorySheetName: cleanString_(inventorySheetName) || APP.defaultInventorySheetName
+    config: getConfigStatus_()
+  };
+}
+
+/** Optional admin utility for script editor. */
+function getConfigStatus() {
+  return getConfigStatus_();
+}
+
+/** Optional menu helper for admins (not required by web app flow). */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Inventory Admin')
+    .addItem('Refresh QR Links', 'refreshQrLinks')
+    .addItem('Show Config Status (Logs)', 'logConfigStatus_')
+    .addToUi();
+}
+
+function logConfigStatus_() {
+  Logger.log(JSON.stringify(getConfigStatus_(), null, 2));
+}
+
+/** ---------------------------
+ *  Config helpers
+ *  --------------------------- */
+
+function getConfigStatus_() {
+  const props = PropertiesService.getScriptProperties();
+  const spreadsheetId = safeString_(props.getProperty('SPREADSHEET_ID'));
+  const webAppBaseUrl = safeString_(props.getProperty('WEB_APP_BASE_URL'));
+  const inventorySheetName = safeString_(props.getProperty('INVENTORY_SHEET_NAME'));
+
+  return {
+    spreadsheetIdConfigured: !!spreadsheetId,
+    webAppBaseUrlConfigured: !!webAppBaseUrl,
+    inventorySheetNameConfigured: !!inventorySheetName,
+    spreadsheetId: spreadsheetId,
+    webAppBaseUrl: webAppBaseUrl,
+    inventorySheetName: inventorySheetName
   };
 }
 
 function getSpreadsheet_() {
-  const spreadsheetId = cleanString_(PropertiesService.getScriptProperties().getProperty(APP.propertyKeys.spreadsheetId));
+  const spreadsheetId = safeString_(PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID'));
   if (!spreadsheetId) {
-    throw new Error('Configuration error: SPREADSHEET_ID is not set in Script Properties.');
+    throw new Error('Configuration error: SPREADSHEET_ID is not set.');
   }
   return SpreadsheetApp.openById(spreadsheetId);
 }
 
 function getInventorySheet_() {
   const ss = getSpreadsheet_();
-  const configuredName = cleanString_(PropertiesService.getScriptProperties().getProperty(APP.propertyKeys.inventorySheetName));
-  const preferredName = configuredName || APP.defaultInventorySheetName;
-  return ss.getSheetByName(preferredName) || ss.getSheets()[0];
+  const preferredName = safeString_(PropertiesService.getScriptProperties().getProperty('INVENTORY_SHEET_NAME'));
+
+  let sheet = null;
+  if (preferredName) {
+    sheet = ss.getSheetByName(preferredName);
+  }
+  if (!sheet) {
+    sheet = ss.getSheetByName(DEFAULT_SHEET_NAME);
+  }
+  if (!sheet) {
+    const sheets = ss.getSheets();
+    if (!sheets || !sheets.length) {
+      throw new Error('Configuration error: no sheets found in spreadsheet.');
+    }
+    sheet = sheets[0];
+  }
+  return sheet;
 }
 
+function getWebAppBaseUrl_() {
+  const raw = safeString_(PropertiesService.getScriptProperties().getProperty('WEB_APP_BASE_URL'));
+  if (!raw) {
+    throw new Error('Configuration error: WEB_APP_BASE_URL is not set.');
+  }
+  return raw.replace(/\/+$/, '');
+}
+
+/** ---------------------------
+ *  Data helpers
+ *  --------------------------- */
+
 function getColumnMap_(sheet) {
-  const lastCol = sheet.getLastColumn();
+  const targetSheet = sheet || getInventorySheet_();
+  const lastCol = targetSheet.getLastColumn();
   if (lastCol < 1) {
-    throw new Error('Configuration error: inventory sheet is missing a header row.');
+    throw new Error('Configuration error: header row is missing.');
   }
 
-  const headerRow = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(normalizeHeader_);
-  const map = {};
+  const headers = targetSheet.getRange(1, 1, 1, lastCol).getValues()[0].map(normalizeHeader_);
 
-  Object.keys(APP.headerAliases).forEach(function (key) {
-    const aliases = APP.headerAliases[key];
-    const index = headerRow.findIndex(function (value) {
-      return aliases.indexOf(value) !== -1;
-    });
-    if (index === -1) {
-      throw new Error('Configuration error: missing required column for ' + key + '.');
-    }
-    map[key] = index + 1;
+  const aliases = {
+    itemId: ['item id', 'itemid', 'id'],
+    itemName: ['item name', 'name', 'item'],
+    room: ['room'],
+    location: ['specific location', 'location', 'loc'],
+    qty: ['qty', 'quantity', 'stock', 'count'],
+    category: ['category', 'type'],
+    status: ['status', 'condition'],
+    qrLink: ['qr code link (auto-generated)', 'qr code link', 'qr link', 'qrcode link'],
+    unit: ['unit'],
+    remarks: ['remarks', 'remark', 'notes', 'note'],
+    locationCode: ['location code', 'loc code', 'locationcode']
+  };
+
+  const map = {};
+  Object.keys(aliases).forEach(function(field) {
+    map[field] = findHeaderIndex_(headers, aliases[field]);
+  });
+
+  const missing = REQUIRED_FIELDS.filter(function(field) {
+    return map[field] <= 0;
+  });
+  if (missing.length) {
+    throw new Error('Configuration error: missing required columns: ' + missing.join(', '));
+  }
+
+  OPTIONAL_FIELDS.forEach(function(field) {
+    if (!map[field] || map[field] < 0) map[field] = -1;
   });
 
   return map;
@@ -197,149 +281,562 @@ function getColumnMap_(sheet) {
 
 function getAllLocations_() {
   const sheet = getInventorySheet_();
-  const columnMap = getColumnMap_(sheet);
-  const dataRows = getSheetDataRows_(sheet, columnMap);
-  const baseUrl = safeWebAppUrlForLinks_();
+  const colMap = getColumnMap_(sheet);
+  const lastRow = sheet.getLastRow();
 
-  const dedupe = {};
-  dataRows.forEach(function (row) {
-    const room = cleanString_(row[columnMap.room - 1]);
-    const location = cleanString_(row[columnMap.location - 1]);
+  if (lastRow < 2) return [];
+
+  const width = Math.max(colMap.room, colMap.location);
+  const rows = sheet.getRange(2, 1, lastRow - 1, width).getValues();
+
+  const seen = {};
+  const out = [];
+  const baseUrl = getSafeBaseUrl_();
+
+  rows.forEach(function(row) {
+    const room = safeString_(row[colMap.room - 1]);
+    const location = safeString_(row[colMap.location - 1]);
     if (!room || !location) return;
 
     const key = room + '||' + location;
-    if (dedupe[key]) return;
+    if (seen[key]) return;
 
-    dedupe[key] = {
+    seen[key] = true;
+    out.push({
       room: room,
       location: location,
-      viewUrl: createAppUrl_(baseUrl, room, location, ''),
-      techUrl: createAppUrl_(baseUrl, room, location, 'tech')
-    };
+      viewUrl: baseUrl ? buildLocationUrl_(room, location, false, baseUrl) : '',
+      techUrl: baseUrl ? buildLocationUrl_(room, location, true, baseUrl) : ''
+    });
   });
 
-  return Object.keys(dedupe)
-    .map(function (key) { return dedupe[key]; })
-    .sort(function (a, b) {
-      return (a.room + '|' + a.location).localeCompare(b.room + '|' + b.location);
-    });
+  out.sort(function(a, b) {
+    if (a.room === b.room) return a.location.localeCompare(b.location);
+    return a.room.localeCompare(b.room);
+  });
+
+  return out;
 }
 
 function getInventoryRowsForLocation_(room, loc) {
-  const selectedRoom = cleanString_(room);
-  const selectedLocation = cleanString_(loc);
-  if (!selectedRoom || !selectedLocation) return [];
-
+  const roomValue = safeString_(room);
+  const locValue = safeString_(loc);
   const sheet = getInventorySheet_();
-  const columnMap = getColumnMap_(sheet);
-  const dataRows = getSheetDataRows_(sheet, columnMap);
+  const colMap = getColumnMap_(sheet);
+  const lastRow = sheet.getLastRow();
 
-  return dataRows
-    .map(function (row, index) {
-      return {
-        rowNumber: index + 2,
-        itemId: row[columnMap.itemId - 1],
-        itemName: row[columnMap.itemName - 1],
-        room: cleanString_(row[columnMap.room - 1]),
-        location: cleanString_(row[columnMap.location - 1]),
-        qty: row[columnMap.qty - 1],
-        category: cleanString_(row[columnMap.category - 1]),
-        status: cleanString_(row[columnMap.status - 1])
-      };
-    })
-    .filter(function (item) {
-      return item.room === selectedRoom && item.location === selectedLocation;
-    })
-    .sort(function (a, b) {
-      return String(a.itemName).localeCompare(String(b.itemName));
+  if (lastRow < 2) return [];
+
+  const rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  const items = [];
+
+  rows.forEach(function(row, idx) {
+    const rowRoom = safeString_(row[colMap.room - 1]);
+    const rowLoc = safeString_(row[colMap.location - 1]);
+    if (rowRoom !== roomValue || rowLoc !== locValue) return;
+
+    items.push({
+      rowNumber: idx + 2,
+      itemId: safeString_(row[colMap.itemId - 1]),
+      itemName: safeString_(row[colMap.itemName - 1]),
+      room: rowRoom,
+      location: rowLoc,
+      qty: safeString_(row[colMap.qty - 1]),
+      category: safeString_(row[colMap.category - 1]),
+      status: safeString_(row[colMap.status - 1]),
+      unit: getOptionalValue_(row, colMap.unit),
+      remarks: getOptionalValue_(row, colMap.remarks),
+      locationCode: getOptionalValue_(row, colMap.locationCode)
     });
+  });
+
+  return items;
 }
 
-function getWebAppBaseUrl_() {
-  const configured = cleanString_(PropertiesService.getScriptProperties().getProperty(APP.propertyKeys.webAppBaseUrl));
-  if (configured) return stripQueryString_(configured);
+/** ---------------------------
+ *  Route/page state helpers
+ *  --------------------------- */
 
-  const serviceUrl = cleanString_(ScriptApp.getService().getUrl());
-  if (serviceUrl) return stripQueryString_(serviceUrl);
+function buildPageState_(e) {
+  const params = (e && e.parameter) || {};
+  const room = safeString_(params.room);
+  const location = safeString_(params.loc);
+  const mode = safeString_(params.mode).toLowerCase() === 'tech' ? 'tech' : 'view';
+  const isLocationRoute = !!(room && location);
 
-  throw new Error('Configuration error: WEB_APP_BASE_URL is not set in Script Properties.');
-}
+  const cfg = getConfigStatus_();
+  const notices = [];
 
-function parseParams_(e) {
-  const p = (e && e.parameter) || {};
-  return {
-    room: cleanString_(p.room),
-    location: cleanString_(p.loc),
-    mode: cleanString_(p.mode).toLowerCase() === 'tech' ? 'tech' : 'view'
-  };
-}
+  if (!cfg.spreadsheetIdConfigured) {
+    notices.push({ type: 'error', text: 'Configuration error: SPREADSHEET_ID is not set.' });
+    return buildBaseState_({
+      mode: 'landing',
+      room: '',
+      location: '',
+      items: [],
+      locations: [],
+      notices: notices,
+      config: cfg,
+      columns: null
+    });
+  }
 
-function buildPageState_(params) {
-  const hasSelection = !!(params.room && params.location);
-  const page = {
-    title: APP.title,
-    mode: params.mode,
-    room: params.room,
-    location: params.location,
-    hasSelection: hasSelection,
-    notice: '',
-    error: '',
-    items: [],
-    locations: [],
-    locationsByRoom: [],
-    appUrlConfigured: true
-  };
+  if (!cfg.webAppBaseUrlConfigured) {
+    notices.push({
+      type: 'warn',
+      text: 'WEB_APP_BASE_URL is not configured. Location links are disabled until this is set.'
+    });
+  }
+
+  let columns = null;
+  let locations = [];
+  let items = [];
 
   try {
-    getWebAppBaseUrl_();
-  } catch (urlErr) {
-    page.appUrlConfigured = false;
-  }
+    const sheet = getInventorySheet_();
+    columns = getColumnMap_(sheet);
+    locations = getAllLocations_();
 
-  if (hasSelection) {
-    page.items = getInventoryRowsForLocation_(params.room, params.location);
-    if (!page.items.length) {
-      page.notice = 'No inventory records found for this location.';
+    if (sheet.getLastRow() < 2) {
+      notices.push({ type: 'warn', text: 'Inventory sheet is currently empty.' });
     }
-  } else {
-    page.locations = getAllLocations_();
-    page.locationsByRoom = groupLocationsByRoom_(page.locations);
-    if (!page.locations.length) {
-      page.notice = 'No locations are available yet. Add inventory rows to the sheet first.';
+
+    if (isLocationRoute) {
+      items = getInventoryRowsForLocation_(room, location);
+      if (!items.length) {
+        notices.push({ type: 'warn', text: 'No inventory records found for this location.' });
+      }
+    } else if (!locations.length) {
+      notices.push({ type: 'info', text: 'No inventory locations found yet.' });
     }
+  } catch (err) {
+    notices.push({ type: 'error', text: err && err.message ? err.message : String(err) });
+    return buildBaseState_({
+      mode: isLocationRoute ? mode : 'landing',
+      room: room,
+      location: location,
+      items: [],
+      locations: [],
+      notices: notices,
+      config: cfg,
+      columns: columns
+    });
   }
 
-  return page;
+  return buildBaseState_({
+    mode: isLocationRoute ? mode : 'landing',
+    room: room,
+    location: location,
+    items: items,
+    locations: locations,
+    notices: notices,
+    config: cfg,
+    columns: columns
+  });
 }
 
-function getSheetDataRows_(sheet, columnMap) {
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
-  const width = Math.max.apply(null, Object.keys(columnMap).map(function (k) { return columnMap[k]; }));
-  return sheet.getRange(2, 1, lastRow - 1, width).getValues();
+function buildBaseState_(input) {
+  const baseUrl = getSafeBaseUrl_();
+  return {
+    appTitle: 'D&T QR Inventory System',
+    mode: input.mode,
+    room: input.room,
+    location: input.location,
+    isLanding: input.mode === 'landing',
+    isTechMode: input.mode === 'tech',
+    items: input.items || [],
+    locations: input.locations || [],
+    locationsByRoom: groupLocationsByRoom_(input.locations || []),
+    notices: input.notices || [],
+    statusOptions: STATUS_OPTIONS,
+    config: input.config,
+    columns: input.columns,
+    baseUrl: baseUrl,
+    hasBaseUrl: !!baseUrl,
+    debug: DEBUG
+  };
 }
 
-function buildRowLookup_(rows, columnMap) {
-  return rows.reduce(function (acc, row, index) {
-    const rowNumber = index + 2;
-    acc[rowNumber] = {
-      room: cleanString_(row[columnMap.room - 1]),
-      location: cleanString_(row[columnMap.location - 1])
-    };
-    return acc;
-  }, {});
+function buildFatalState_(err) {
+  const msg = (err && err.message) ? err.message : String(err);
+  return buildBaseState_({
+    mode: 'landing',
+    room: '',
+    location: '',
+    items: [],
+    locations: [],
+    notices: [{ type: 'error', text: 'Configuration error: ' + msg }],
+    config: getConfigStatus_(),
+    columns: null
+  });
 }
 
-function validateSavePayloadShape_(payload) {
-  if (!payload || typeof payload !== 'object') {
-    throw new Error('Invalid save payload.');
+/** ---------------------------
+ *  Rendering helpers (server)
+ *  --------------------------- */
+
+function buildShellHtml_(state) {
+  const topControls = renderTopControls_(state);
+  const noticesHtml = renderNotices_(state.notices);
+  const mainContent = state.isLanding ? renderLanding_(state) : renderLocationPage_(state);
+  const debugPanel = state.debug ? renderDebugPanel_(state) : '';
+
+  const clientData = {
+    mode: state.mode,
+    room: state.room,
+    location: state.location,
+    isTechMode: state.isTechMode,
+    statusOptions: state.statusOptions,
+    columns: state.columns,
+    debug: state.debug,
+    hasBaseUrl: state.hasBaseUrl,
+    initialItemCount: state.items.length,
+    initialLocationCount: state.locations.length
+  };
+
+  return [
+    '<!DOCTYPE html>',
+    '<html>',
+    '<head>',
+    '  <meta charset="utf-8">',
+    '  <meta name="viewport" content="width=device-width,initial-scale=1">',
+    '  <title>D&T Inventory</title>',
+    '  <style>', css_(), '</style>',
+    '</head>',
+    '<body>',
+    '  <main class="container">',
+    '    <header class="header">',
+    '      <h1>' + escapeHtml_(state.appTitle) + '</h1>',
+    '      <p class="sub">' + escapeHtml_(state.isLanding
+          ? 'Browse inventory by room/location or scan a QR code.'
+          : ('Room ' + state.room + ' · Location ' + state.location)) + '</p>',
+    '    </header>',
+    topControls,
+    noticesHtml,
+    mainContent,
+    debugPanel,
+    '  </main>',
+    '  <script>window.__APP_DATA__=' + JSON.stringify(clientData) + ';</script>',
+    '  <script>' + clientScript_() + '</script>',
+    '</body>',
+    '</html>'
+  ].join('');
+}
+
+function renderTopControls_(state) {
+  if (state.isLanding) {
+    return [
+      '<div class="top-actions disabled-state">',
+      '  <button class="btn secondary" disabled title="Choose a location card first">View Mode</button>',
+      '  <button class="btn" disabled title="Choose a location card first">Technician Access</button>',
+      '</div>'
+    ].join('');
   }
-  if (!Array.isArray(payload.items) || !payload.items.length) {
-    throw new Error('Invalid save payload: no item updates were supplied.');
-  }
+
+  const viewUrl = state.hasBaseUrl ? buildLocationUrl_(state.room, state.location, false, state.baseUrl) : '#';
+  const techUrl = state.hasBaseUrl ? buildLocationUrl_(state.room, state.location, true, state.baseUrl) : '#';
+  const homeUrl = state.hasBaseUrl ? state.baseUrl : '#';
+
+  return [
+    '<div class="top-actions">',
+    '  <a class="btn ' + (state.isTechMode ? 'secondary' : '') + '" href="' + escapeHtml_(viewUrl) + '">View Mode</a>',
+    '  <a class="btn ' + (state.isTechMode ? '' : 'secondary') + '" href="' + escapeHtml_(techUrl) + '">Technician Access</a>',
+    '  <a class="btn ghost" href="' + escapeHtml_(homeUrl) + '">All Locations</a>',
+    '</div>'
+  ].join('');
 }
 
-function safeWebAppUrlForLinks_() {
+function renderNotices_(notices) {
+  if (!notices || !notices.length) return '';
+  return '<section class="notices">' + notices.map(function(n) {
+    return '<div class="notice ' + escapeHtml_(n.type || 'info') + '">' + escapeHtml_(n.text || '') + '</div>';
+  }).join('') + '</section>';
+}
+
+function renderLanding_(state) {
+  const rooms = Object.keys(state.locationsByRoom || {}).sort(function(a, b) {
+    return a.localeCompare(b);
+  });
+
+  if (!rooms.length) {
+    return '<section class="empty">No inventory locations found yet.</section>';
+  }
+
+  const groupsHtml = rooms.map(function(room) {
+    const cardsHtml = state.locationsByRoom[room].map(function(loc) {
+      const viewBtn = state.hasBaseUrl
+        ? '<a class="btn secondary" href="' + escapeHtml_(loc.viewUrl) + '">Open View</a>'
+        : '<button class="btn secondary" disabled>Open View</button>';
+      const techBtn = state.hasBaseUrl
+        ? '<a class="btn" href="' + escapeHtml_(loc.techUrl) + '">Open Tech</a>'
+        : '<button class="btn" disabled>Open Tech</button>';
+
+      return [
+        '<article class="card">',
+        '  <h3>' + escapeHtml_(loc.location) + '</h3>',
+        '  <p class="muted">Room ' + escapeHtml_(loc.room) + '</p>',
+        '  <div class="row-actions">',
+        viewBtn,
+        techBtn,
+        '  </div>',
+        '</article>'
+      ].join('');
+    }).join('');
+
+    return [
+      '<section class="room-group">',
+      '  <h2>Room ' + escapeHtml_(room) + '</h2>',
+      '  <div class="card-grid">', cardsHtml, '  </div>',
+      '</section>'
+    ].join('');
+  }).join('');
+
+  return '<section class="landing">' + groupsHtml + '</section>';
+}
+
+function renderLocationPage_(state) {
+  const itemCardsHtml = renderItemCardsHtml_(state.items, state.isTechMode, state.columns);
+
+  const saveSection = state.isTechMode
+    ? [
+        '<div class="save-panel">',
+        '  <button id="saveBtn" class="btn">Save Changes</button>',
+        '  <div id="saveMsg" class="save-msg"></div>',
+        '</div>',
+        '<p id="bridgeWarn" class="bridge-warning" style="display:none">',
+        'Interactive save is unavailable in this context. Open the deployed /exec web app URL.',
+        '</p>'
+      ].join('')
+    : '';
+
+  return [
+    '<section class="location-view">',
+    '  <div id="itemList" class="item-list">', itemCardsHtml, '</div>',
+    saveSection,
+    '</section>'
+  ].join('');
+}
+
+function renderItemCardsHtml_(items, isTechMode, colMap) {
+  if (!items || !items.length) {
+    return '<div class="empty">No inventory records found for this location.</div>';
+  }
+
+  const hasUnit = !!(colMap && colMap.unit > 0);
+  const hasRemarks = !!(colMap && colMap.remarks > 0);
+  const hasLocationCode = !!(colMap && colMap.locationCode > 0);
+
+  return items.map(function(item) {
+    const isChemical = safeString_(item.category).toLowerCase() === 'chemicals';
+    const normalizedStatus = normalizeStatus_(item.status) || safeString_(item.status);
+
+    const qtyField = isTechMode
+      ? '<input class="qty-input" type="number" min="0" step="1" data-field="qty" data-row="' + item.rowNumber + '" value="' + escapeHtml_(item.qty) + '">'
+      : '<span class="value">' + escapeHtml_(item.qty) + '</span>';
+
+    const statusField = isTechMode
+      ? ('<select class="status-select" data-field="status" data-row="' + item.rowNumber + '">' +
+          STATUS_OPTIONS.map(function(opt) {
+            const selected = (opt === normalizedStatus) ? ' selected' : '';
+            return '<option value="' + escapeHtml_(opt) + '"' + selected + '>' + escapeHtml_(opt) + '</option>';
+          }).join('') +
+         '</select>')
+      : '<span class="status-pill ' + statusClass_(normalizedStatus) + '">' + escapeHtml_(normalizedStatus || item.status) + '</span>';
+
+    const extraRows = [
+      (hasUnit && item.unit) ? '<div><span class="k">Unit</span><span class="v">' + escapeHtml_(item.unit) + '</span></div>' : '',
+      (hasLocationCode && item.locationCode) ? '<div><span class="k">Location Code</span><span class="v">' + escapeHtml_(item.locationCode) + '</span></div>' : '',
+      (hasRemarks && item.remarks) ? '<div class="remarks"><span class="k">Remarks</span><span class="v">' + escapeHtml_(item.remarks) + '</span></div>' : ''
+    ].join('');
+
+    return [
+      '<article class="item-card ' + (isChemical ? 'hazard' : '') + '">',
+      '  <div class="item-head">',
+      '    <h3>' + escapeHtml_(item.itemName || item.itemId) + '</h3>',
+      isChemical ? '    <span class="hazard-badge">Hazard</span>' : '',
+      '  </div>',
+      isChemical ? '  <p class="hazard-note">Chemical item — handle/store according to safety procedure.</p>' : '',
+      '  <p class="muted">' + escapeHtml_(item.itemId) + ' · ' + escapeHtml_(item.category || 'Uncategorized') + '</p>',
+      '  <div class="item-grid">',
+      '    <label>Qty</label>', qtyField,
+      '    <label>Status</label>', statusField,
+      '  </div>',
+      '  <div class="meta-grid">',
+      extraRows,
+      '  </div>',
+      '</article>'
+    ].join('');
+  }).join('');
+}
+
+function renderDebugPanel_(state) {
+  return [
+    '<aside class="debug-panel">',
+    '  <h4>Debug</h4>',
+    '  <ul>',
+    '    <li>mode: ' + escapeHtml_(state.mode) + '</li>',
+    '    <li>room: ' + escapeHtml_(state.room || '-') + '</li>',
+    '    <li>location: ' + escapeHtml_(state.location || '-') + '</li>',
+    '    <li>items loaded: ' + state.items.length + '</li>',
+    '    <li>locations loaded: ' + state.locations.length + '</li>',
+    '    <li>web app URL configured: ' + (state.config.webAppBaseUrlConfigured ? 'true' : 'false') + '</li>',
+    '    <li>google.script.run exists: <span id="dbgBridge">(checking...)</span></li>',
+    '  </ul>',
+    '</aside>'
+  ].join('');
+}
+
+/** ---------------------------
+ *  Client helpers
+ *  --------------------------- */
+
+function clientScript_() {
+  return [
+    '(function(){',
+    '  var app = window.__APP_DATA__ || {};',
+    '  var hasBridge = !!(window.google && google.script && google.script.run);',
+    '  var dbgBridge = document.getElementById("dbgBridge");',
+    '  if (dbgBridge) dbgBridge.textContent = hasBridge ? "true" : "false";',
+    '  if (!app.isTechMode) return;',
+    '  var saveBtn = document.getElementById("saveBtn");',
+    '  var saveMsg = document.getElementById("saveMsg");',
+    '  var itemList = document.getElementById("itemList");',
+    '  var warn = document.getElementById("bridgeWarn");',
+    '  if (!hasBridge) {',
+    '    if (warn) warn.style.display = "block";',
+    '    if (saveBtn) saveBtn.disabled = true;',
+    '    return;',
+    '  }',
+    '  if (!saveBtn) return;',
+    '  saveBtn.addEventListener("click", function(){',
+    '    var qtyEls = Array.prototype.slice.call(document.querySelectorAll("input[data-field=qty]"));',
+    '    var statusEls = Array.prototype.slice.call(document.querySelectorAll("select[data-field=status]"));',
+    '    var byRow = {};',
+    '    qtyEls.forEach(function(el){',
+    '      var r = el.getAttribute("data-row");',
+    '      byRow[r] = byRow[r] || { rowNumber: Number(r) };',
+    '      byRow[r].qty = el.value;',
+    '    });',
+    '    statusEls.forEach(function(el){',
+    '      var r = el.getAttribute("data-row");',
+    '      byRow[r] = byRow[r] || { rowNumber: Number(r) };',
+    '      byRow[r].status = el.value;',
+    '    });',
+    '    var updates = Object.keys(byRow).map(function(k){ return byRow[k]; });',
+    '    if (!updates.length) {',
+    '      saveMsg.textContent = "No updates to save.";',
+    '      saveMsg.className = "save-msg";',
+    '      return;',
+    '    }',
+    '    saveBtn.disabled = true;',
+    '    saveMsg.textContent = "Saving...";',
+    '    saveMsg.className = "save-msg";',
+    '    google.script.run',
+    '      .withSuccessHandler(function(res){',
+    '        saveBtn.disabled = false;',
+    '        if (!res || !res.ok) {',
+    '          saveMsg.textContent = (res && res.message) ? res.message : "Save failed.";',
+    '          saveMsg.className = "save-msg err";',
+    '          return;',
+    '        }',
+    '        saveMsg.textContent = res.message || "Saved.";',
+    '        saveMsg.className = "save-msg ok";',
+    '        if (itemList && res.renderedItemsHtml) {',
+    '          itemList.innerHTML = res.renderedItemsHtml;',
+    '        }',
+    '      })',
+    '      .withFailureHandler(function(err){',
+    '        saveBtn.disabled = false;',
+    '        saveMsg.textContent = (err && err.message) ? err.message : "Save failed.";',
+    '        saveMsg.className = "save-msg err";',
+    '      })',
+    '      .saveInventoryUpdates({',
+    '        room: app.room,',
+    '        location: app.location,',
+    '        updates: updates',
+    '      });',
+    '  });',
+    '})();'
+  ].join('');
+}
+
+function css_() {
+  return [
+    ':root{--bg:#f8fafc;--surface:#ffffff;--text:#0f172a;--muted:#475569;--line:#e2e8f0;--brand:#1d4ed8;--good:#166534;--low:#c2410c;--missing:#b91c1c;--maint:#ea580c;}',
+    '*{box-sizing:border-box;}',
+    'body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 Arial,sans-serif;}',
+    '.container{max-width:980px;margin:0 auto;padding:14px 14px 28px;}',
+    '.header h1{margin:0;font-size:1.45rem;}',
+    '.header .sub{margin:.4rem 0 0;color:var(--muted);}',
+    '.top-actions{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0;}',
+    '.disabled-state .btn{opacity:.6;cursor:not-allowed;}',
+    '.btn{display:inline-block;padding:10px 14px;border-radius:10px;background:var(--brand);color:#fff;border:0;text-decoration:none;font-weight:700;font-size:.95rem;}',
+    '.btn.secondary{background:#334155;}',
+    '.btn.ghost{background:#e2e8f0;color:#0f172a;}',
+    '.btn[disabled]{pointer-events:none;}',
+    '.notices{display:grid;gap:8px;margin:10px 0 16px;}',
+    '.notice{border-radius:10px;padding:10px 12px;border:1px solid var(--line);background:#fff;}',
+    '.notice.info{border-color:#bfdbfe;background:#eff6ff;color:#1e3a8a;}',
+    '.notice.warn{border-color:#fed7aa;background:#fff7ed;color:#9a3412;}',
+    '.notice.error{border-color:#fecaca;background:#fef2f2;color:#991b1b;}',
+    '.room-group{margin:18px 0;}',
+    '.room-group h2{margin:0 0 10px;font-size:1.05rem;}',
+    '.card-grid{display:grid;grid-template-columns:1fr;gap:10px;}',
+    '.card,.item-card,.empty{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px;}',
+    '.card h3,.item-card h3{margin:0;font-size:1.04rem;}',
+    '.muted{margin:.35rem 0;color:var(--muted);}',
+    '.row-actions{display:flex;gap:8px;flex-wrap:wrap;}',
+    '.item-list{display:grid;gap:10px;}',
+    '.item-card.hazard{border-color:#f59e0b;background:#fffbeb;}',
+    '.item-head{display:flex;justify-content:space-between;align-items:center;gap:8px;}',
+    '.hazard-badge{padding:4px 8px;border-radius:999px;background:#b91c1c;color:#fff;font-size:.72rem;font-weight:700;}',
+    '.hazard-note{margin:.45rem 0;color:#7c2d12;font-size:.88rem;}',
+    '.item-grid{display:grid;grid-template-columns:90px 1fr;gap:8px 10px;align-items:center;margin:.45rem 0;}',
+    '.qty-input,.status-select{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;font-size:1rem;}',
+    '.value{font-weight:700;}',
+    '.status-pill{display:inline-block;padding:5px 9px;border-radius:999px;font-size:.84rem;font-weight:700;}',
+    '.status-good{background:#dcfce7;color:var(--good);}',
+    '.status-low{background:#ffedd5;color:var(--low);}',
+    '.status-missing{background:#fee2e2;color:var(--missing);}',
+    '.status-maint{background:#ffedd5;color:var(--maint);}',
+    '.status-default{background:#e2e8f0;color:#334155;}',
+    '.meta-grid{display:grid;grid-template-columns:1fr;gap:6px;margin-top:6px;}',
+    '.meta-grid .k{display:inline-block;min-width:105px;color:var(--muted);font-size:.9rem;}',
+    '.meta-grid .v{font-size:.95rem;}',
+    '.remarks{padding-top:2px;border-top:1px dashed #dbe2ea;}',
+    '.save-panel{position:sticky;bottom:0;background:rgba(248,250,252,.95);backdrop-filter:blur(2px);padding-top:10px;margin-top:10px;display:flex;gap:10px;align-items:center;}',
+    '.save-msg{font-weight:700;color:#334155;}',
+    '.save-msg.ok{color:#166534;}',
+    '.save-msg.err{color:#b91c1c;}',
+    '.bridge-warning{margin-top:10px;background:#fff7ed;color:#9a3412;border:1px solid #fed7aa;border-radius:10px;padding:10px;}',
+    '.debug-panel{margin-top:14px;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:10px;font-family:monospace;font-size:.83rem;}',
+    '.debug-panel h4{margin:0 0 6px;}',
+    '.debug-panel ul{margin:0;padding-left:18px;}',
+    '@media (min-width:760px){.container{padding:20px 20px 32px;}.header h1{font-size:1.8rem;}.card-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}'
+  ].join('');
+}
+
+/** ---------------------------
+ *  Utility helpers
+ *  --------------------------- */
+
+function groupLocationsByRoom_(locations) {
+  const grouped = {};
+  (locations || []).forEach(function(loc) {
+    if (!grouped[loc.room]) grouped[loc.room] = [];
+    grouped[loc.room].push(loc);
+  });
+  return grouped;
+}
+
+function buildLocationUrl_(room, location, techMode, baseUrl) {
+  const root = (baseUrl || getWebAppBaseUrl_()).replace(/\/+$/, '');
+  let url = root + '?room=' + encodeURIComponent(room) + '&loc=' + encodeURIComponent(location);
+  if (techMode) url += '&mode=tech';
+  return url;
+}
+
+function getSafeBaseUrl_() {
   try {
     return getWebAppBaseUrl_();
   } catch (err) {
@@ -347,314 +844,69 @@ function safeWebAppUrlForLinks_() {
   }
 }
 
-function groupLocationsByRoom_(locations) {
-  const groups = {};
-  locations.forEach(function (entry) {
-    if (!groups[entry.room]) groups[entry.room] = [];
-    groups[entry.room].push(entry);
-  });
-
-  return Object.keys(groups)
-    .sort()
-    .map(function (room) {
-      return {
-        room: room,
-        locations: groups[room].sort(function (a, b) {
-          return a.location.localeCompare(b.location);
-        })
-      };
-    });
+function validateSavePayload_(payload) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Invalid save payload.');
+  }
+  if (!safeString_(payload.room) || !safeString_(payload.location)) {
+    throw new Error('Invalid save payload: room and location are required.');
+  }
+  if (!Array.isArray(payload.updates) || payload.updates.length === 0) {
+    throw new Error('Invalid save payload: updates must be a non-empty array.');
+  }
 }
 
 function normalizeHeader_(value) {
-  return cleanString_(value).toLowerCase().replace(/\s+/g, ' ');
+  return safeString_(value)
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-function cleanString_(value) {
-  return String(value == null ? '' : value).trim();
+function findHeaderIndex_(normalizedHeaders, allowedAliases) {
+  for (let i = 0; i < normalizedHeaders.length; i++) {
+    if (allowedAliases.indexOf(normalizedHeaders[i]) !== -1) {
+      return i + 1;
+    }
+  }
+  return -1;
 }
 
-function stripQueryString_(url) {
-  return cleanString_(url).split('?')[0];
+function normalizeStatus_(status) {
+  const key = safeString_(status).toLowerCase();
+  return STATUS_CANONICAL_MAP[key] || '';
 }
 
-function createAppUrl_(baseUrl, room, location, mode) {
-  const root = stripQueryString_(baseUrl);
-  if (!root) return '#';
-
-  const parts = [
-    'room=' + encodeURIComponent(room),
-    'loc=' + encodeURIComponent(location)
-  ];
-  if (mode) parts.push('mode=' + encodeURIComponent(mode));
-  return root + '?' + parts.join('&');
+function normalizeQty_(qty) {
+  const n = Number(qty);
+  return Number.isFinite(n) ? n : NaN;
 }
 
 function statusClass_(status) {
-  const value = cleanString_(status);
-  if (value === 'Good') return 'status-good';
-  if (value === 'Low Stock') return 'status-low';
-  if (value === 'Missing') return 'status-missing';
-  if (value === 'Needs Maintenance') return 'status-maintenance';
-  return '';
+  const normalized = normalizeStatus_(status) || safeString_(status).toLowerCase();
+  if (normalized === 'good') return 'status-good';
+  if (normalized === 'low stock') return 'status-low';
+  if (normalized === 'missing') return 'status-missing';
+  if (normalized === 'needs maintenance') return 'status-maint';
+  return 'status-default';
+}
+
+function getOptionalValue_(row, colIndex) {
+  if (!colIndex || colIndex < 1) return '';
+  return safeString_(row[colIndex - 1]);
+}
+
+function safeString_(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).trim();
 }
 
 function escapeHtml_(value) {
-  return String(value == null ? '' : value)
+  return safeString_(value)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
-}
-
-function renderAppHtml_(page) {
-  const baseUrl = safeWebAppUrlForLinks_();
-  const viewHref = page.hasSelection ? createAppUrl_(baseUrl, page.room, page.location, '') : '#';
-  const techHref = page.hasSelection ? createAppUrl_(baseUrl, page.room, page.location, 'tech') : '#';
-
-  const bootstrap = JSON.stringify({
-    mode: page.mode,
-    room: page.room,
-    location: page.location,
-    hasSelection: page.hasSelection,
-    statuses: APP.statuses,
-    debug: DEBUG,
-    itemCount: page.items.length,
-    locationCount: page.locations.length
-  }).replace(/</g, '\\u003c');
-
-  const content = page.hasSelection ? renderLocationView_(page) : renderLandingView_(page);
-  const debugPanel = DEBUG ? renderDebugPanel_(page) : '';
-
-  return [
-    '<!DOCTYPE html>',
-    '<html><head>',
-    '<meta charset="utf-8">',
-    '<meta name="viewport" content="width=device-width, initial-scale=1">',
-    '<title>', escapeHtml_(APP.title), '</title>',
-    '<style>', baseStyles_(), '</style>',
-    '</head><body>',
-    '<div class="app-shell">',
-    '<header class="page-header">',
-    '  <h1>', escapeHtml_(APP.title), '</h1>',
-    '  <div class="subhead"><strong>Room:</strong> ', escapeHtml_(page.room || '-'), ' · <strong>Location:</strong> ', escapeHtml_(page.location || '-'), '</div>',
-    '  <div class="top-actions">',
-    '    <a class="button secondary ', page.hasSelection ? '' : 'disabled', '" href="', page.hasSelection ? escapeHtml_(viewHref) : '#', '">View Mode</a>',
-    '    <a class="button primary ', page.hasSelection ? '' : 'disabled', '" href="', page.hasSelection ? escapeHtml_(techHref) : '#', '">Technician Access</a>',
-    '  </div>',
-    '</header>',
-    content,
-    debugPanel,
-    '</div>',
-    '<script>const BOOTSTRAP=', bootstrap, ';</script>',
-    '<script>', clientScript_(), '</script>',
-    '</body></html>'
-  ].join('');
-}
-
-function renderLandingView_(page) {
-  const groupsHtml = page.locationsByRoom.length
-    ? page.locationsByRoom.map(function (group) {
-        return [
-          '<section class="room-group">',
-          '<div class="room-heading">ROOM ', escapeHtml_(group.room), '</div>',
-          group.locations.map(function (entry) {
-            return [
-              '<div class="location-card">',
-              '<div class="location-name">', escapeHtml_(entry.location), '</div>',
-              '<div class="location-meta">Room: ', escapeHtml_(entry.room), '</div>',
-              '<div class="location-actions">',
-              '<a class="button secondary" href="', escapeHtml_(entry.viewUrl), '">Open View</a>',
-              '<a class="button primary" href="', escapeHtml_(entry.techUrl), '">Open Tech</a>',
-              '</div>',
-              '</div>'
-            ].join('');
-          }).join(''),
-          '</section>'
-        ].join('');
-      }).join('')
-    : '<div class="empty-state">' + escapeHtml_(page.notice || 'No locations found.') + '</div>';
-
-  return [
-    '<main class="panel">',
-    '<div class="panel-head"><h2>Landing</h2><span class="mode-pill">Browse Locations</span></div>',
-    '<div class="hero"><h3>Choose a location</h3><p>Scan a QR code or pick a room/location below.</p></div>',
-    (!page.appUrlConfigured ? '<div class="notice error">Configuration error: WEB_APP_BASE_URL is not set. Links and QR generation will not work until configured.</div>' : ''),
-    groupsHtml,
-    '</main>'
-  ].join('');
-}
-
-function renderLocationView_(page) {
-  const modeLabel = page.mode === 'tech' ? 'Tech Mode' : 'View Mode';
-
-  const items = page.items.length
-    ? page.items.map(function (item) { return renderItemCard_(item, page.mode === 'tech'); }).join('')
-    : '<div class="empty-state">' + escapeHtml_(page.notice || 'No inventory records found for this location.') + '</div>';
-
-  const saveBar = page.mode === 'tech'
-    ? '<div class="save-bar"><button id="saveButton" class="button primary">Save Changes</button><span id="saveMessage" class="save-message"></span></div>'
-    : '';
-
-  return [
-    '<main class="panel">',
-    '<div class="panel-head"><h2>Inventory Items</h2><span class="mode-pill">', escapeHtml_(modeLabel), '</span></div>',
-    page.notice ? '<div class="notice info">' + escapeHtml_(page.notice) + '</div>' : '',
-    saveBar,
-    '<div id="inventoryList" class="inventory-list">', items, '</div>',
-    '</main>'
-  ].join('');
-}
-
-function renderItemCard_(item, techMode) {
-  const isChemical = normalizeHeader_(item.category) === 'chemicals';
-  const qtyValue = escapeHtml_(String(item.qty));
-  const statusClass = statusClass_(item.status);
-
-  return [
-    '<article class="item-card ', isChemical ? 'hazard' : '', '" data-row="', escapeHtml_(String(item.rowNumber)), '">',
-    '<div class="item-header">',
-    '<div><div class="item-name">', escapeHtml_(item.itemName), '</div><div class="item-meta">', escapeHtml_(item.itemId), ' · ', escapeHtml_(item.category), '</div></div>',
-    isChemical ? '<span class="hazard-badge">HAZARD</span>' : '',
-    '</div>',
-    '<div class="item-grid">',
-    '<div><label>Quantity</label>',
-    techMode
-      ? '<input class="field-input qty-input" type="number" min="0" step="1" value="' + qtyValue + '">'
-      : '<div class="field-value">' + qtyValue + '</div>',
-    '</div>',
-    '<div><label>Status</label>',
-    techMode ? renderStatusSelect_(item.status) : '<div class="status-pill ' + statusClass + '">' + escapeHtml_(item.status) + '</div>',
-    '</div>',
-    '</div>',
-    isChemical ? '<div class="hazard-note">Chemical item — follow storage and handling procedures.</div>' : '',
-    '</article>'
-  ].join('');
-}
-
-function renderStatusSelect_(selectedValue) {
-  const options = APP.statuses.map(function (status) {
-    const selected = status === selectedValue ? ' selected' : '';
-    return '<option value="' + escapeHtml_(status) + '"' + selected + '>' + escapeHtml_(status) + '</option>';
-  }).join('');
-  return '<select class="field-select status-select">' + options + '</select>';
-}
-
-function renderDebugPanel_(page) {
-  return [
-    '<section class="panel debug-panel">',
-    '<div class="panel-head"><h2>Debug</h2></div>',
-    '<div class="debug-grid">',
-    '<div><strong>mode:</strong> ', escapeHtml_(page.mode), '</div>',
-    '<div><strong>room:</strong> ', escapeHtml_(page.room || '-'), '</div>',
-    '<div><strong>location:</strong> ', escapeHtml_(page.location || '-'), '</div>',
-    '<div><strong>items loaded:</strong> ', escapeHtml_(String(page.items.length)), '</div>',
-    '<div><strong>locations loaded:</strong> ', escapeHtml_(String(page.locations.length)), '</div>',
-    '<div><strong>google.script.run:</strong> <span id="bridgeStatus">(checking...)</span></div>',
-    '</div>',
-    '</section>'
-  ].join('');
-}
-
-function renderConfigErrorHtml_(err) {
-  const message = err && err.message ? err.message : String(err);
-  return [
-    '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">',
-    '<title>', escapeHtml_(APP.title), '</title>',
-    '<style>', baseStyles_(), '</style>',
-    '</head><body><div class="app-shell">',
-    '<header class="page-header"><h1>', escapeHtml_(APP.title), '</h1></header>',
-    '<main class="panel">',
-    '<div class="panel-head"><h2>Configuration error</h2></div>',
-    '<div class="notice error">', escapeHtml_(message), '</div>',
-    '<div class="empty-state">Set Script Properties: SPREADSHEET_ID and WEB_APP_BASE_URL (and optional INVENTORY_SHEET_NAME). Then redeploy if needed.</div>',
-    '</main></div></body></html>'
-  ].join('');
-}
-
-function baseStyles_() {
-  return [
-    ':root{--bg:#eef3f8;--card:#fff;--text:#14213d;--muted:#55627a;--line:#d6dee8;--primary:#4f46e5;--secondary:#e7edf4;--success:#e6f4ea;--success-text:#166534;--warn:#fff4e5;--warn-text:#b45309;--danger:#fde8e8;--danger-text:#b91c1c;--hazard:#fff1f2;--shadow:0 2px 10px rgba(16,24,40,.06);--radius:20px;}',
-    '*{box-sizing:border-box}',
-    'body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--text)}',
-    '.app-shell{max-width:1180px;margin:0 auto;padding:28px 20px 48px}',
-    '.page-header h1{margin:0 0 8px;font-size:44px;line-height:1.1;letter-spacing:-0.02em}',
-    '.subhead{color:var(--muted);font-size:18px;margin-bottom:16px}',
-    '.top-actions{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}',
-    '.button{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border:none;border-radius:12px;padding:12px 16px;font-size:15px;font-weight:700;cursor:pointer}',
-    '.button.primary{background:var(--primary);color:#fff}',
-    '.button.secondary{background:var(--secondary);color:#243147}',
-    '.button.disabled{opacity:.45;pointer-events:none}',
-    '.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}',
-    '.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 20px;border-bottom:1px solid var(--line)}',
-    '.panel-head h2{margin:0;font-size:24px}',
-    '.mode-pill{padding:8px 12px;border-radius:999px;background:#dbeafe;color:#1d4ed8;font-size:13px;font-weight:700}',
-    '.hero{background:#eaf2ff;padding:20px;border-bottom:1px solid var(--line)}',
-    '.hero h3{margin:0 0 8px;font-size:24px}',
-    '.hero p{margin:0;color:#334155;font-size:16px}',
-    '.room-group + .room-group{border-top:1px solid var(--line)}',
-    '.room-heading{padding:12px 20px;background:#f4f7fb;border-bottom:1px solid var(--line);font-weight:800;letter-spacing:.06em;color:#475569;font-size:13px}',
-    '.location-card{padding:18px 20px;border-bottom:1px solid var(--line)}',
-    '.location-card:last-child{border-bottom:none}',
-    '.location-name{font-size:22px;font-weight:800;margin-bottom:6px}',
-    '.location-meta{color:#64748b;font-size:15px;margin-bottom:14px}',
-    '.location-actions{display:flex;gap:10px;flex-wrap:wrap}',
-    '.inventory-list{padding:16px;display:grid;gap:12px}',
-    '.item-card{border:1px solid var(--line);border-radius:16px;padding:14px;background:#fff}',
-    '.item-card.hazard{background:var(--hazard);border-color:#fecdd3}',
-    '.item-header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}',
-    '.item-name{font-size:20px;font-weight:800;margin-bottom:4px}',
-    '.item-meta{color:#64748b;font-size:14px}',
-    '.hazard-badge{background:#dc2626;color:#fff;border-radius:999px;padding:6px 10px;font-size:11px;font-weight:800;letter-spacing:.04em}',
-    '.item-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}',
-    'label{display:block;font-size:12px;font-weight:700;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}',
-    '.field-input,.field-select,.field-value{width:100%;min-height:42px;border-radius:10px;border:1px solid var(--line);padding:10px 12px;font-size:15px;background:#fff}',
-    '.field-value{display:flex;align-items:center;font-weight:700;color:#1f2937}',
-    '.status-pill{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border-radius:10px;padding:8px 12px;font-weight:800;border:1px solid transparent;width:100%}',
-    '.status-good{background:var(--success);color:var(--success-text);border-color:#bbf7d0}',
-    '.status-low{background:var(--warn);color:var(--warn-text);border-color:#fed7aa}',
-    '.status-missing{background:var(--danger);color:var(--danger-text);border-color:#fecaca}',
-    '.status-maintenance{background:#fff7ed;color:#c2410c;border-color:#fdba74}',
-    '.hazard-note{margin-top:10px;color:#991b1b;font-size:13px;font-weight:700}',
-    '.notice{margin:14px 16px 0;padding:12px 14px;border-radius:12px;font-weight:700}',
-    '.notice.info{background:#eff6ff;color:#1d4ed8}',
-    '.notice.error{background:var(--danger);color:var(--danger-text)}',
-    '.save-bar{display:flex;align-items:center;gap:12px;padding:16px;border-bottom:1px solid var(--line);flex-wrap:wrap}',
-    '.save-message{font-weight:700;color:#334155}',
-    '.empty-state{padding:20px;color:#64748b;font-size:16px}',
-    '.debug-panel{margin-top:16px}',
-    '.debug-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:16px 20px}',
-    '@media (max-width:720px){.page-header h1{font-size:34px}.subhead{font-size:16px}.panel-head h2{font-size:20px}.item-grid{grid-template-columns:1fr}.button{width:100%}.location-actions .button{width:auto}}'
-  ].join('');
-}
-
-function clientScript_() {
-  return [
-    '(function(){',
-    'var bridgeAvailable=!!(window.google&&google.script&&google.script.run);',
-    'if(BOOTSTRAP.debug){var statusNode=document.getElementById("bridgeStatus");if(statusNode){statusNode.textContent=bridgeAvailable?"available":"unavailable";}}',
-    'if(!(BOOTSTRAP.hasSelection&&BOOTSTRAP.mode==="tech")){return;}',
-    'var saveButton=document.getElementById("saveButton");',
-    'var saveMessage=document.getElementById("saveMessage");',
-    'if(!bridgeAvailable){if(saveMessage){saveMessage.textContent="Interactive save is unavailable in this context. Open the deployed /exec web app URL.";}if(saveButton){saveButton.disabled=true;saveButton.classList.add("disabled");}return;}',
-    'if(!saveButton){return;}',
-    'saveButton.addEventListener("click",function(){',
-    'var cards=Array.prototype.slice.call(document.querySelectorAll(".item-card[data-row]"));',
-    'var items=cards.map(function(card){',
-    'var rowNumber=Number(card.getAttribute("data-row"));',
-    'var qtyInput=card.querySelector(".qty-input");',
-    'var statusSelect=card.querySelector(".status-select");',
-    'return{rowNumber:rowNumber,qty:qtyInput?Number(qtyInput.value):0,status:statusSelect?statusSelect.value:""};',
-    '});',
-    'if(saveMessage){saveMessage.textContent="Saving...";}',
-    'google.script.run.withSuccessHandler(function(result){',
-    'if(!result||!result.ok){if(saveMessage){saveMessage.textContent=(result&&result.message)?result.message:"Save failed.";}return;}',
-    'if(saveMessage){saveMessage.textContent=result.message||"Saved.";}',
-    '}).withFailureHandler(function(error){',
-    'if(saveMessage){saveMessage.textContent=(error&&error.message)?error.message:String(error);}',
-    '}).saveInventoryUpdates({room:BOOTSTRAP.room,location:BOOTSTRAP.location,items:items});',
-    '});',
-    '})();'
-  ].join('');
 }
