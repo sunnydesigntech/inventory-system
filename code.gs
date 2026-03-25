@@ -938,6 +938,7 @@ function normalizeStatus_(status) {
   return STATUS_CANONICAL_MAP[key] || '';
 }
 
+
 function normalizeQty_(qty) {
   const n = Number(qty);
   return Number.isFinite(n) ? n : NaN;
